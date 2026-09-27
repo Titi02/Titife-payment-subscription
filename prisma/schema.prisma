@@ -1,0 +1,241 @@
+// schema.prisma — PRD Section 9 data model, locked shape (AGENTS.md Section 2)
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum PlanType {
+  FREE
+  MONTHLY
+  YEARLY
+}
+
+enum BillingInterval {
+  MONTHLY
+  YEARLY
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  PAST_DUE
+  CANCELLING // cancelAtPeriodEnd = true, still has access
+  CANCELED // period end has passed, no access
+}
+
+// Payment log event types. CALLBACK_VERIFIED records that a Paystack webhook
+// passed x-paystack-signature HMAC verification — it does NOT mean the payment
+// succeeded. Success/failure are carried by CHARGE_SUCCESS / CHARGE_FAILURE.
+enum PaymentLogType {
+  INITIATION
+  VERIFICATION
+  CALLBACK_VERIFIED
+  FULFILMENT
+  CHARGE_SUCCESS
+  CHARGE_FAILURE
+  REFUND_PROCESSED
+  DUPLICATE_IGNORED
+}
+
+enum CancellationReason {
+  TOO_EXPENSIVE
+  MISSING_FEATURES
+  SWITCHING_PROVIDER
+  TEMPORARY_PAUSE
+  OTHER
+}
+
+// Lifecycle summary of a single payment attempt (see Transaction model).
+// Mirrors the PaymentLogType stages: INITIATION -> VERIFIED -> SUCCESS,
+// or FAILED on a declined charge, or REFUNDED on the Phase-5 duplicate
+// auto-refund path.
+enum TransactionStatus {
+  INITIATED
+  VERIFIED
+  SUCCESS
+  FAILED
+  REFUNDED
+}
+
+// Non-status annotations attached to a Transaction. Distinct from
+// TransactionStatus (which is the single lifecycle state); these are
+// additive flags, one row per (transaction, flagType).
+enum TransactionFlagType {
+  DUPLICATE_CHARGE
+  STUCK
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String? // ASSUMPTION: standalone auth; swap for
+  // Assessment 1 auth's user table/field in
+  // real integration
+  createdAt    DateTime @default(now())
+
+  paystackCustomerCode String? @unique
+
+  subscription Subscription?
+  paymentLogs  PaymentLog[]
+  transactions Transaction[]
+}
+
+model Subscription {
+  id     String @id @default(cuid())
+  user   User   @relation(fields: [userId], references: [id])
+  userId String @unique
+
+  planType PlanType           @default(FREE)
+  interval BillingInterval?
+  status   SubscriptionStatus @default(ACTIVE)
+
+  currentPeriodStart DateTime?
+  currentPeriodEnd   DateTime?
+
+  cancelAtPeriodEnd  Boolean             @default(false)
+  cancellationReason CancellationReason?
+  cancellationNote   String? // free text, only meaningful when
+  // reason = OTHER
+  cancelledAt        DateTime?
+
+  pendingPlanType PlanType?
+  pendingInterval BillingInterval?
+
+  // Reusable Paystack token returned by hosted checkout.
+  // Never a card number -- an opaque reference readable only
+  // through Paystack's own APIs.
+  paystackAuthorizationCode String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Supports the reconciliation sweep (Section 5.10 / FR-23 / FR-29):
+  // find subscriptions whose period just ended, or whose
+  // cancellation just took effect, without a full table scan.
+  @@index([currentPeriodEnd, cancelAtPeriodEnd])
+}
+
+// Transaction — one row per payment attempt (providerReference). This is the
+// "current state" summary for a charge; PaymentLog is the append-only
+// system of record, and each lifecycle event links back to its Transaction.
+model Transaction {
+  id     String @id @default(cuid())
+  user   User   @relation(fields: [userId], references: [id])
+  userId String
+
+  // This system's own reference (sub_<uuid> / upg_<uuid>). NOT unique:
+  // AGENTS.md Section 2 forbids standalone-unique columns on
+  // providerReference or paystackTransactionId — idempotency lives on
+  // PaymentLog's composite constraints. One reference normally produces one
+  // Transaction row, but nothing in the schema may depend on that.
+  providerReference String
+
+  // Paystack's numeric transaction id (data.id). Null until Paystack has
+  // actually processed the charge (INITIATION happens before that). NOT
+  // unique, per AGENTS.md Section 2.
+  paystackTransactionId String?
+
+  amount   Int    @default(0) // minor units (kobo). 0 for pure status events.
+  currency String @default("ngn")
+
+  planType PlanType?
+  interval BillingInterval?
+
+  status TransactionStatus @default(INITIATED)
+
+  logs  PaymentLog[]
+  flags TransactionFlag[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@index([providerReference])
+  @@index([paystackTransactionId])
+}
+
+// Transaction-level flags — typed, additive annotations that are not part of
+// the single lifecycle status. Idempotent: one row per (transaction, flagType).
+model TransactionFlag {
+  id            String      @id @default(cuid())
+  transaction   Transaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  transactionId String
+
+  flagType TransactionFlagType
+  note     String?
+  metadata Json?
+
+  createdAt DateTime @default(now())
+
+  @@unique([transactionId, flagType])
+}
+
+// Append-only payment log. This table is the system of record;
+// the Subscription table above is a derived projection of it.
+model PaymentLog {
+  id     String @id @default(cuid())
+  user   User   @relation(fields: [userId], references: [id])
+  userId String
+
+  // Optional link to the parent Transaction (the per-attempt summary row).
+  // Nullable so DUPLICATE_IGNORED audit rows and any historical rows written
+  // before this relation existed can remain unlinked without weakening the
+  // append-only log.
+  transaction   Transaction? @relation(fields: [transactionId], references: [id], onDelete: SetNull)
+  transactionId String?
+
+  eventType PaymentLogType
+
+  // Generated by this system per attempt. NOT unique on its own --
+  // the same transaction legitimately produces multiple rows
+  // (INITIATION, VERIFICATION, FULFILMENT), all sharing this value.
+  providerReference String
+
+  // Paystack's own numeric transaction id (data.id in the
+  // webhook payload). Also NOT unique on its own, for the same
+  // reason as providerReference above.
+  paystackTransactionId String?
+
+  amount   Int    @default(0) // minor units (kobo). 0 for pure status events.
+  currency String @default("ngn")
+
+  planType PlanType?
+  interval BillingInterval?
+
+  // e.g. { creditApplied: 800000, previousInterval: "MONTHLY",
+  //         newInterval: "YEARLY", previousPeriodStart: "...",
+  //         previousPeriodEnd: "..." }
+  metadata Json?
+
+  createdAt DateTime @default(now())
+
+  // These two composite constraints ARE the idempotency guards:
+  // the same transaction cannot produce two rows for the same
+  // lifecycle stage. Both are needed since paystackTransactionId
+  // is null on the INITIATION row (Paystack hasn't assigned one
+  // yet at that point).
+  @@unique([providerReference, eventType])
+  @@unique([paystackTransactionId, eventType])
+  @@index([userId])
+  @@index([transactionId])
+}
+
+// Database-backed rate limiting for the checkout initiation
+// endpoint (FR-5), so the limit holds regardless of whether
+// this app runs as one process or many stateless instances.
+// Keyed by string, not a foreign key, since this is a
+// short-lived counter rather than a durable relation to User.
+// Key format must stay consistent across all call sites
+// (e.g. always "checkout:{userId}", never a variant of it).
+// The increment against this row must be a single atomic
+// statement (see Section 7.2) -- not a separate read then write.
+model RateLimitBucket {
+  id          String   @id @default(cuid())
+  key         String   @unique // e.g. "checkout:{userId}"
+  count       Int      @default(0)
+  windowStart DateTime
+}
