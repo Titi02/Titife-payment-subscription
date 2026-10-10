@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { createPortal } from "react-dom";
 import { useRouter } from "next/navigation";
 
 interface DowngradeButtonProps {
@@ -19,7 +20,8 @@ interface DowngradeButtonProps {
  * system never auto-charges, the user must start a Monthly payment themselves
  * once the boundary passes.
  *
- * Requires an explicit confirmation step (FR-25). The server call only records
+ * Requires an explicit confirmation step (FR-25), shown as a styled in-page
+ * dialog rather than a native browser confirm(). The server call only records
  * intent and grants nothing (FR-8).
  */
 export function DowngradeButton({
@@ -27,24 +29,18 @@ export function DowngradeButton({
   label,
   className,
 }: DowngradeButtonProps) {
+  const [open, setOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const router = useRouter();
 
-  const handleDowngrade = async () => {
-    const detail =
-      targetPlan === "MONTHLY"
-        ? "You keep your Yearly access until the current billing cycle ends. At that point your plan changes to Monthly, and you will need to start a Monthly payment to keep access."
-        : "You keep access until the current billing cycle ends. Your plan then reverts to Free.";
+  const targetLabel = targetPlan === "MONTHLY" ? "Monthly" : "Free";
+  const detail =
+    targetPlan === "MONTHLY"
+      ? "You keep your Yearly access until the current billing cycle ends. At that point your plan changes to Monthly, and you will need to start a Monthly payment to keep access."
+      : "You keep access until the current billing cycle ends. Your plan then reverts to Free.";
 
-    if (
-      !window.confirm(
-        `Are you sure you want to downgrade to ${targetPlan === "MONTHLY" ? "Monthly" : "Free"}? ${detail}`
-      )
-    ) {
-      return;
-    }
-
+  const handleConfirm = async () => {
     setLoading(true);
     setError(null);
     try {
@@ -61,12 +57,13 @@ export function DowngradeButton({
         throw new Error(data.error || "Failed to downgrade");
       }
 
+      setOpen(false);
       router.refresh();
-      setLoading(false);
     } catch (err: unknown) {
       setError(
         err instanceof Error ? err.message : "An unknown error occurred"
       );
+    } finally {
       setLoading(false);
     }
   };
@@ -75,11 +72,15 @@ export function DowngradeButton({
     <div>
       <button
         className={className ?? "btn btn--outline"}
-        onClick={handleDowngrade}
+        onClick={() => {
+          setError(null);
+          setOpen(true);
+        }}
         disabled={loading}
       >
         {loading ? "Processing..." : label}
       </button>
+
       {error && (
         <div
           style={{
@@ -91,6 +92,40 @@ export function DowngradeButton({
           {error}
         </div>
       )}
+
+      {open &&
+        createPortal(
+          <div
+            className="modal-overlay"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="downgrade-modal-title"
+          >
+            <div className="modal">
+              <h2 id="downgrade-modal-title" className="modal__title">
+                {`Downgrade to ${targetLabel}?`}
+              </h2>
+              <p className="modal__note">{detail}</p>
+              <div className="modal__actions">
+                <button
+                  className="btn btn--primary"
+                  onClick={handleConfirm}
+                  disabled={loading}
+                >
+                  {loading ? "Processing..." : "Confirm downgrade"}
+                </button>
+                <button
+                  className="btn btn--outline"
+                  onClick={() => setOpen(false)}
+                  disabled={loading}
+                >
+                  Keep current plan
+                </button>
+              </div>
+            </div>
+          </div>,
+          document.body,
+        )}
     </div>
   );
 }

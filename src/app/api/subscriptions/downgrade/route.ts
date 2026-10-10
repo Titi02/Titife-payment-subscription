@@ -43,7 +43,15 @@ export async function POST(req: NextRequest) {
 
   const entitlement = await getUserEntitlement(user.id);
 
-  if (entitlement.status !== "ACTIVE") {
+  // Allow downgrade when paid term is still active (including subscriptions
+  // already scheduled for cancellation at period end). Do not rely solely on
+  // the derived status label.
+  const paidTermActive =
+    entitlement.planType !== "FREE" &&
+    entitlement.currentPeriodEnd !== null &&
+    new Date() <= entitlement.currentPeriodEnd;
+
+  if (!paidTermActive) {
     return NextResponse.json(
       { error: "No active subscription to downgrade" },
       { status: 400 }

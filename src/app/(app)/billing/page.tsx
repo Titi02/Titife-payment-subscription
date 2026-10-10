@@ -134,7 +134,7 @@ export default async function BillingPage() {
                     Subscribe Monthly
                   </button>
                 </form>
-              ) : planType === "YEARLY" && status === "ACTIVE" ? (
+              ) : planType === "YEARLY" ? (
                 entitlement.pendingPlanType === "MONTHLY" ? (
                   <button className="btn btn--disabled btn--full-width" disabled>
                     Downgrade Pending
